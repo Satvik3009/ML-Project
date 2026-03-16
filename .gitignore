@@ -1,0 +1,9 @@
+data/
+checkpoints/
+outputs/
+
+*.pth
+*.pt
+*.h5
+*.npy
+*.mat
