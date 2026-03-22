@@ -7,7 +7,7 @@ from PIL import Image
 # CHANGE THIS PATH TO YOUR DATASET FOLDER
 # =====================================================
 
-DATASET_PATH = r"C:\Users\HP\ML_project\data\MNE-sample-data"
+DATASET_PATH = r"C:\Users\HP\ML_project\data\fmri"
 
 print("\n===== DATASET ROOT CONTENT =====\n")
 for item in os.listdir(DATASET_PATH):
