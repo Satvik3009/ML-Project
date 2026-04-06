@@ -1,12 +1,12 @@
 import os
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 from torchvision.datasets import ImageFolder
-from torchvision.models import efficientnet_b2, EfficientNet_B2_Weights
-from torch.utils.data import DataLoader, TensorDataset, random_split, WeightedRandomSampler
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.optim.lr_scheduler import LambdaLR
 
 import pickle
 import nibabel as nib
@@ -16,17 +16,20 @@ from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+# KEY CHANGE: ViT pretrained on FER+ emotion data
+from transformers import AutoModel
+
 # =====================================
 # PATHS
 # =====================================
 
 DATA_DIR = r"C:\Users\HP\ML_project\data"
 
-FER_PATH    = os.path.join(DATA_DIR, "FER2013")
-DEAP_PATH   = os.path.join(DATA_DIR, "deap-dataset", "data_preprocessed_python")
-FMRI_PATH   = os.path.join(DATA_DIR, "fmri")
+FER_PATH  = os.path.join(DATA_DIR, "FER2013")
+DEAP_PATH = os.path.join(DATA_DIR, "deap-dataset", "data_preprocessed_python")
+FMRI_PATH = os.path.join(DATA_DIR, "fmri")
 
-MODEL_PATH  = "emotion_model_v3.pth"
+MODEL_PATH = "emotion_model_v4.pth"
 
 # =====================================
 # DEVICE
@@ -36,39 +39,41 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # =====================================
-# CONFIG  (tune here without touching code below)
+# CONFIG
 # =====================================
 
 CFG = dict(
-    batch_size   = 16,      # 16 safe for 4GB VRAM with EfficientNet-B2
-    epochs       = 10,
-    lr           = 3e-4,
-    weight_decay = 1e-4,
-    dropout      = 0.4,
-    grad_clip    = 1.0,
-    eeg_dim      = 32 * 5,  # 32 channels × 5 frequency bands
-    fmri_dim     = 32,
-    face_dim     = 1408,    # EfficientNet-B2 output dim (vs 1280 for MobileNetV2)
-    num_classes  = 7,
-    img_size     = 260,     # EfficientNet-B2 native resolution
+    batch_size        = 16,
+    epochs            = 15,      # ↑ from 10
+    lr                = 3e-4,    # head LR; backbone gets 1e-5 (see optimizer)
+    weight_decay      = 1e-4,
+    dropout           = 0.3,     # ↓ slightly — ViT is already regularised
+    grad_clip         = 1.0,
+    warmup_epochs     = 2,       # NEW: linear warmup prevents early instability
+    eeg_dim           = 32 * 5,  # 32 channels × 5 freq bands
+    fmri_dim          = 32,
+    face_dim          = 768,     # ViT-B/16 [CLS] hidden size (vs 1408 for EfficientNet-B2)
+    num_classes       = 7,
+    img_size          = 224,     # ViT-B/16 native resolution (vs 260)
+    freeze_vit_layers = 8,       # freeze first 8/12 blocks, fine-tune last 4
 )
 
 # =====================================
-# FER2013 — with augmentation
+# FER2013 — TRANSFORMS
 # =====================================
 
-# Training: augmentation at EfficientNet-B2 native resolution (260x260)
 train_transform = transforms.Compose([
     transforms.Grayscale(),
     transforms.Resize((CFG["img_size"], CFG["img_size"])),
     transforms.RandomHorizontalFlip(),
-    transforms.RandomRotation(10),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomRotation(15),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.1),
+    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),  # NEW: spatial shift
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.5], std=[0.5]),
+    transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),      # NEW: occlusion robustness
 ])
 
-# Test: deterministic, same normalisation
 test_transform = transforms.Compose([
     transforms.Grayscale(),
     transforms.Resize((CFG["img_size"], CFG["img_size"])),
@@ -76,28 +81,20 @@ test_transform = transforms.Compose([
     transforms.Normalize(mean=[0.5], std=[0.5]),
 ])
 
-train_data   = ImageFolder(os.path.join(FER_PATH, "train"), transform=train_transform)
-test_data    = ImageFolder(os.path.join(FER_PATH, "test"),  transform=test_transform)
+train_data = ImageFolder(os.path.join(FER_PATH, "train"), transform=train_transform)
+test_data  = ImageFolder(os.path.join(FER_PATH, "test"),  transform=test_transform)
 
-# ---- Weighted sampler — fixes class imbalance in FER2013 ----
-# Counts how many samples exist per class, then assigns each sample
-# an inverse-frequency weight so rare classes (disgust, fear) are
-# seen as often as common ones (happy, neutral) during training.
-class_counts  = np.bincount([s[1] for s in train_data.samples])
-class_weights = 1.0 / class_counts
+# Weighted sampler — keeps class imbalance from dominating
+class_counts   = np.bincount([s[1] for s in train_data.samples])
+class_weights  = 1.0 / class_counts
 sample_weights = torch.tensor(
     [class_weights[s[1]] for s in train_data.samples], dtype=torch.float
 )
-sampler = WeightedRandomSampler(
-    weights     = sample_weights,
-    num_samples = len(sample_weights),
-    replacement = True,
-)
+sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 print("Class counts:", dict(zip(train_data.classes, class_counts)))
 
 train_loader = DataLoader(train_data, batch_size=CFG["batch_size"],
-                          sampler=sampler,          # replaces shuffle=True
-                          num_workers=0, pin_memory=True)
+                          sampler=sampler, num_workers=0, pin_memory=True)
 test_loader  = DataLoader(test_data,  batch_size=CFG["batch_size"],
                           num_workers=0, pin_memory=True)
 
@@ -105,31 +102,54 @@ emotion_labels = train_data.classes
 print("Emotion classes:", emotion_labels)
 
 # =====================================
-# FACE ENCODER  (EfficientNet-B2)
+# FACE ENCODER — ViT pretrained on FER+
 # =====================================
-# EfficientNet-B2 outputs 1408-d features vs MobileNetV2's 1280-d.
-# Better at fine-grained differences (disgust vs angry, fear vs sad).
-# Native resolution 260x260 — much richer spatial features than 48x48.
+#
+# WHY THIS MATTERS:
+#   Old code used EfficientNet-B2 pretrained on ImageNet (objects, scenes).
+#   Facial micro-expressions (disgust vs fear, anger vs surprise) are
+#   completely out of ImageNet's distribution — the features just don't
+#   transfer well without extensive training.
+#
+#   trpakov/vit-face-expression is ViT-B/16 already fine-tuned on FER+,
+#   so its attention heads are already tuned to eyes, brows, mouth corners
+#   — the exact regions that distinguish emotions. We just adapt it to
+#   FER2013's label scheme.
+#
+# STRATEGY:
+#   Freeze the first 8 of 12 transformer blocks (stable low-level texture
+#   and face structure), fine-tune the last 4 (emotion-specific semantics).
 
 class FaceEncoder(nn.Module):
-    def __init__(self, dropout=0.4):
+    def __init__(self,
+                 model_name="trpakov/vit-face-expression",
+                 dropout=0.3,
+                 freeze_layers=8):
         super().__init__()
-        base             = efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1)
-        self.features    = base.features
-        self.pool        = nn.AdaptiveAvgPool2d((1, 1))
-        self.drop        = nn.Dropout(p=dropout)
+        self.vit  = AutoModel.from_pretrained(model_name,
+                                              ignore_mismatched_sizes=True)
+        self.drop = nn.Dropout(p=dropout)
 
-    def forward(self, x):                       # x: (B, 1, 260, 260)
-        x = x.repeat(1, 3, 1, 1)               # → (B, 3, 260, 260)
-        x = self.features(x)
-        x = self.pool(x)
-        x = x.view(x.size(0), -1)              # (B, 1408)
-        return self.drop(x)
+        # Freeze patch embeddings + positional encodings
+        for param in self.vit.embeddings.parameters():
+            param.requires_grad = False
+
+        # Freeze first `freeze_layers` attention blocks
+        for i, block in enumerate(self.vit.encoder.layer):
+            if i < freeze_layers:
+                for param in block.parameters():
+                    param.requires_grad = False
+
+    def forward(self, x):                    # x: (B, 1, 224, 224) grayscale
+        x   = x.repeat(1, 3, 1, 1)          # → (B, 3, 224, 224)  [ViT expects RGB]
+        out = self.vit(pixel_values=x)
+        cls = out.last_hidden_state[:, 0]    # [CLS] token → (B, 768)
+        return self.drop(cls)
+
 
 # =====================================
 # EEG FEATURE EXTRACTION — band power
 # =====================================
-# 5 bands × 32 channels = 160-d vector per trial (vs 32-d before)
 
 BANDS = {
     "delta": (1,  4),
@@ -145,15 +165,12 @@ def bandpower(psd, freqs, low, high):
 
 def extract_eeg_features():
     features, labels = [], []
-
     for file in os.listdir(DEAP_PATH):
         path = os.path.join(DEAP_PATH, file)
         with open(path, "rb") as f:
             data = pickle.load(f, encoding="latin1")
-
         eeg = data["data"][:, :32, :]          # (40 trials, 32 ch, 8064 samples)
         lab = data["labels"]
-
         for trial in range(eeg.shape[0]):
             psd_features = []
             for ch in range(32):
@@ -161,33 +178,24 @@ def extract_eeg_features():
                 for low, high in BANDS.values():
                     psd_features.append(bandpower(psd, freqs, low, high))
             features.append(psd_features)
-            labels.append(lab[trial][0])        # valence as proxy label
-
-    X = np.array(features, dtype=np.float32)
-    y = np.array(labels,   dtype=np.float32)
-
-    # Binarise valence → 0 (low) / 1 (high) for EEG auxiliary task
+            labels.append(lab[trial][0])
+    X     = np.array(features, dtype=np.float32)
+    y     = np.array(labels,   dtype=np.float32)
     y_bin = (y > 5).astype(np.int64)
-
-    # Z-score across trials — critical for stable training
     scaler = StandardScaler()
     X = scaler.fit_transform(X)
-
     return X, y_bin
 
 print("Extracting EEG features (band power)...")
 eeg_X, eeg_y = extract_eeg_features()
-print(f"  EEG feature matrix: {eeg_X.shape}")   # should be (N_trials, 160)
+print(f"  EEG feature matrix: {eeg_X.shape}")
 
 # =====================================
-# fMRI FEATURE EXTRACTION — regional means
+# fMRI FEATURE EXTRACTION
 # =====================================
-# FIX: extract per-volume means along time axis so each subject gives
-# a richer feature vector rather than one scalar.
 
 def extract_fmri_features(target_dim=32):
     features = []
-
     for sub in os.listdir(FMRI_PATH):
         sub_path = os.path.join(FMRI_PATH, sub)
         if not os.path.isdir(sub_path):
@@ -195,25 +203,18 @@ def extract_fmri_features(target_dim=32):
         for file in os.listdir(sub_path):
             if file.endswith(".nii") or file.endswith(".nii.gz"):
                 img  = nib.load(os.path.join(sub_path, file))
-                data = img.get_fdata()           # (X, Y, Z) or (X, Y, Z, T)
-                # Flatten spatial dims, average if 4-D
+                data = img.get_fdata()
                 if data.ndim == 4:
                     vec = data.reshape(-1, data.shape[-1]).mean(axis=1)
                 else:
                     vec = data.flatten()
-                # Subsample / pad to fixed length
-                if len(vec) >= target_dim:
-                    vec = vec[:target_dim]
-                else:
-                    vec = np.pad(vec, (0, target_dim - len(vec)))
+                vec = vec[:target_dim] if len(vec) >= target_dim else \
+                      np.pad(vec, (0, target_dim - len(vec)))
                 features.append(vec.astype(np.float32))
-
     if not features:
-        print("  No fMRI files found — fMRI branch will be disabled.")
+        print("  No fMRI files found — fMRI branch disabled.")
         return None
-
     X = np.array(features)
-    # Z-score
     X = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-8)
     return X
 
@@ -223,40 +224,44 @@ if fmri_X is not None:
     print(f"  fMRI feature matrix: {fmri_X.shape}")
 
 # =====================================
-# MULTIMODAL FUSION MODEL
+# EEG ENCODER
 # =====================================
-# Late-fusion: face + EEG encoders → concatenate → MLP classifier
-# fMRI is optional (many users won't have paired data).
 
 class EEGEncoder(nn.Module):
-    def __init__(self, in_dim, hidden=128, dropout=0.4):
+    def __init__(self, in_dim, hidden=128, dropout=0.3):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.BatchNorm1d(hidden),
-            nn.ReLU(),
+            nn.GELU(),              # GELU matches ViT internals
             nn.Dropout(dropout),
             nn.Linear(hidden, 64),
-            nn.ReLU(),
+            nn.GELU(),
         )
-
     def forward(self, x):
-        return self.net(x)                      # (B, 64)
+        return self.net(x)          # (B, 64)
 
+# =====================================
+# FUSION CLASSIFIER
+# =====================================
 
 class FusionClassifier(nn.Module):
     """
-    Fuses face (1280-d) + EEG (64-d) [+ optional fMRI (fmri_dim-d)]
-    into a single emotion prediction.
+    ViT face features (768) + EEG features (64) [+ optional fMRI (32)]
+    → LayerNorm → MLP → 7-class emotion logits.
+
+    LayerNorm is used instead of BatchNorm before the classifier because
+    it works better with ViT-style feature distributions.
     """
     def __init__(self, use_fmri=False, fmri_dim=32,
-                 num_classes=7, dropout=0.4):
+                 num_classes=7, dropout=0.3):
         super().__init__()
-        self.face_enc = FaceEncoder(dropout=dropout)
+        self.face_enc = FaceEncoder(dropout=dropout,
+                                    freeze_layers=CFG["freeze_vit_layers"])
         self.eeg_enc  = EEGEncoder(CFG["eeg_dim"], dropout=dropout)
 
         self.use_fmri = use_fmri
-        fused_dim = 1408 + 64               # EfficientNet-B2 (1408) + EEG (64)
+        fused_dim = 768 + 64        # ViT [CLS] (768) + EEG encoder out (64)
         if use_fmri:
             self.fmri_enc = nn.Sequential(
                 nn.Linear(fmri_dim, 32),
@@ -264,25 +269,26 @@ class FusionClassifier(nn.Module):
             )
             fused_dim += 32
 
+        # LayerNorm → Linear → GELU → Dropout → Linear
+        # LayerNorm is more stable than BatchNorm when features come from ViT
         self.classifier = nn.Sequential(
+            nn.LayerNorm(fused_dim),
             nn.Linear(fused_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(256, num_classes),
         )
 
     def forward(self, img, eeg, fmri=None):
-        face_feat = self.face_enc(img)          # (B, 1280)
-        eeg_feat  = self.eeg_enc(eeg)           # (B, 64)
+        face_feat = self.face_enc(img)
+        eeg_feat  = self.eeg_enc(eeg)
         parts     = [face_feat, eeg_feat]
 
         if self.use_fmri and fmri is not None:
-            parts.append(self.fmri_enc(fmri))   # (B, 32)
+            parts.append(self.fmri_enc(fmri))
 
-        fused  = torch.cat(parts, dim=1)
-        logits = self.classifier(fused)
-        return logits
+        fused = torch.cat(parts, dim=1)
+        return self.classifier(fused)
 
 
 use_fmri = fmri_X is not None
@@ -294,106 +300,113 @@ model    = FusionClassifier(
 ).to(device)
 
 print(f"\nModel ready  |  use_fmri={use_fmri}")
-total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-print(f"Trainable parameters: {total_params:,}")
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+frozen    = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+print(f"Trainable params: {trainable:,}  |  Frozen params: {frozen:,}")
 
 # =====================================
-# TRAINING (face-only path for FER2013)
-# NOTE: Full fusion requires paired face+EEG samples.
-#       FER2013 doesn't have paired EEG, so we train face path on FER2013
-#       and EEG encoder separately on DEAP, then fine-tune together.
+# CHECKPOINT LOADING
 # =====================================
-
-# =====================================
-# FOCAL LOSS
-# =====================================
-# Focal loss down-weights easy/confident predictions (happy, surprise)
-# and focuses training on hard confused ones (disgust, fear, angry, sad).
-# gamma=2 is standard; higher = more focus on hard examples.
-
-class FocalLoss(nn.Module):
-    def __init__(self, weight=None, gamma=2.0):
-        super().__init__()
-        self.gamma  = gamma
-        self.weight = weight   # per-class weights
-
-    def forward(self, logits, targets):
-        ce_loss = nn.functional.cross_entropy(
-            logits, targets, weight=self.weight, reduction="none"
-        )
-        pt      = torch.exp(-ce_loss)                    # confidence of correct class
-        focal   = (1 - pt) ** self.gamma * ce_loss      # penalise easy examples less
-        return focal.mean()
-
-# ---- PHASE 1: train face encoder on FER2013 ----
-
-# ---- Load old face weights if checkpoint exists, train everything else fresh ----
+# Architecture changed (EfficientNet → ViT), so old weights are incompatible.
+# Skip old checkpoint entirely — the pretrained ViT backbone is already a much
+# better starting point than any FER2013-trained EfficientNet checkpoint.
 
 if os.path.exists(MODEL_PATH):
-    print("\nFound existing checkpoint — loading old face encoder weights only...")
-    checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-
-    if "face" in checkpoint:
-        # Old format: {"face": ..., "classifier": ...}
-        # Remap old face keys → new face_enc sub-module structure
-        face_state = checkpoint["face"]
-        remapped = {}
-        for k, v in face_state.items():
-            new_key = k if k.startswith("features.") else "features." + k
-            # Old model had Conv2d(1→32) for grayscale; new model expects Conv2d(3→32).
-            # Expand the weight by repeating the single input channel 3 times
-            # and scaling down so the sum stays equivalent.
-            if new_key == "features.0.0.weight" and v.shape[1] == 1:
-                v = v.repeat(1, 3, 1, 1) / 3.0
-            remapped[new_key] = v
-
-        missing, unexpected = model.face_enc.load_state_dict(remapped, strict=False)
-        print(f"  Face encoder loaded  |  missing: {len(missing)}  unexpected: {len(unexpected)}")
-
-        # Warm-start the fusion head bias from old classifier bias if shapes match
-        if "classifier" in checkpoint:
-            old_bias = checkpoint["classifier"]["bias"]   # (7,)
-            new_final = model.classifier[-1]
-            if new_final.bias.shape == old_bias.shape:
-                with torch.no_grad():
-                    new_final.bias.copy_(old_bias)
-                print("  Old classifier bias transferred to fusion head.")
-
-        print("  EEG encoder, fMRI encoder, fusion MLP → training from scratch.")
-
-    else:
-        # Already new flat format — load fully
-        print("  Checkpoint is new format — loading full model...")
-        model.load_state_dict(checkpoint, strict=False)
-
+    print(f"\nFound {MODEL_PATH} — attempting to load...")
+    try:
+        state = torch.load(MODEL_PATH, map_location=device, weights_only=False)
+        model.load_state_dict(state, strict=False)
+        print("  Checkpoint loaded (strict=False — missing ViT keys are expected).")
+    except Exception as e:
+        print(f"  Could not load checkpoint ({e}). Training from pretrained ViT.")
 else:
-    print("\nNo checkpoint found — training from scratch.")
+    print("\nNo checkpoint — training from pretrained ViT backbone.")
 
-# ---- Optimizer, Scheduler, Loss ----
+# =====================================
+# OPTIMIZER — differential learning rates
+# =====================================
+#
+# CRITICAL DESIGN CHOICE:
+#   Backbone (ViT pretrained on FER+) → very low LR (1e-5)
+#     We want it to barely move — just adapt to FER2013's label scheme.
+#   EEG encoder + fusion head → normal LR (3e-4)
+#     These train from scratch so they need a proper step size.
+#
+# Using a single LR for both (as in the old code) would either:
+#   - destroy pretrained features (too high), or
+#   - never train the new head (too low).
+
+backbone_params = list(model.face_enc.vit.parameters())
+head_params = (
+    list(model.face_enc.drop.parameters()) +
+    list(model.eeg_enc.parameters()) +
+    list(model.classifier.parameters())
+)
+if use_fmri:
+    head_params += list(model.fmri_enc.parameters())
 
 optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr           = CFG["lr"],
-    weight_decay = CFG["weight_decay"],
+    [
+        {"params": backbone_params, "lr": 1e-5},    # ← very low for pretrained ViT
+        {"params": head_params,     "lr": CFG["lr"]},
+    ],
+    weight_decay=CFG["weight_decay"],
 )
 
-scheduler = CosineAnnealingLR(optimizer, T_max=CFG["epochs"], eta_min=1e-6)
+# =====================================
+# SCHEDULER — linear warmup + cosine decay
+# =====================================
+#
+# Cold-starting with full LR causes gradient spikes that destabilise
+# the pretrained ViT features. 2-epoch linear warmup + cosine decay
+# gives stable convergence.
 
-# Per-class weights: tuned conservatively — too aggressive causes collapse.
-# Order: ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
-manual_weights = torch.tensor([
+steps_per_epoch = len(train_loader)
+total_steps     = CFG["epochs"] * steps_per_epoch
+warmup_steps    = CFG["warmup_epochs"] * steps_per_epoch
+
+def lr_lambda(step):
+    if step < warmup_steps:
+        return float(step) / max(1, warmup_steps)
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return max(1e-2, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+scheduler = LambdaLR(optimizer, lr_lambda)
+
+# =====================================
+# LOSS — label-smoothed cross-entropy
+# =====================================
+#
+# Switched from FocalLoss to label-smoothed CE:
+#   - Focal loss is tricky to tune and can cause training instability
+#     with a partially-frozen pretrained backbone.
+#   - Label smoothing (0.1) prevents overconfident predictions on easy
+#     classes (happy, neutral) and keeps gradients flowing for hard ones.
+#   - Per-class weights still handle the imbalance signal.
+
+per_class_weights = torch.tensor([
     1.5,   # angry
-    2.0,   # disgust  ← boosted but not overwhelming
+    2.0,   # disgust  ← most underrepresented
     1.5,   # fear
-    0.8,   # happy    ← slight reduction, not too harsh
+    0.8,   # happy    ← very common; slight downweight
     1.0,   # neutral
     1.5,   # sad
-    0.8,   # surprise ← slight reduction
+    0.8,   # surprise ← slight downweight
 ], device=device)
 
-criterion = FocalLoss(weight=manual_weights, gamma=1.0)  # gamma 1.0 instead of 2.0 — gentler
+criterion = nn.CrossEntropyLoss(
+    weight          = per_class_weights,
+    label_smoothing = 0.1,
+)
 
-print("\n--- Training fusion model on FER2013 ---")
+# =====================================
+# TRAINING LOOP
+# =====================================
+
+print("\n--- Training on FER2013 ---")
+
+best_acc   = 0.0
+best_state = None
 
 for epoch in range(CFG["epochs"]):
     model.train()
@@ -405,8 +418,10 @@ for epoch in range(CFG["epochs"]):
         imgs   = imgs.to(device)
         labels = labels.to(device)
 
+        # EEG / fMRI not available for FER2013 — use zeros as neutral input
         eeg_dummy  = torch.zeros(imgs.size(0), CFG["eeg_dim"],  device=device)
-        fmri_dummy = torch.zeros(imgs.size(0), CFG["fmri_dim"], device=device) if use_fmri else None
+        fmri_dummy = (torch.zeros(imgs.size(0), CFG["fmri_dim"], device=device)
+                      if use_fmri else None)
 
         optimizer.zero_grad()
         logits = model(imgs, eeg_dummy, fmri_dummy)
@@ -415,28 +430,35 @@ for epoch in range(CFG["epochs"]):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), CFG["grad_clip"])
         optimizer.step()
+        scheduler.step()
 
         total_loss += loss.item()
-        preds       = logits.argmax(1)
-        correct    += (preds == labels).sum().item()
+        correct    += (logits.argmax(1) == labels).sum().item()
         total      += labels.size(0)
 
-    scheduler.step()
-
-    train_acc  = 100 * correct / total
-    current_lr = scheduler.get_last_lr()[0]
+    train_acc  = 100.0 * correct / total
+    head_lr    = optimizer.param_groups[1]["lr"]
+    backbone_lr = optimizer.param_groups[0]["lr"]
     print(f"Epoch {epoch+1:02d}/{CFG['epochs']}  "
           f"Loss: {total_loss:.3f}  "
           f"Train Acc: {train_acc:.1f}%  "
-          f"LR: {current_lr:.2e}")
+          f"LR(head): {head_lr:.2e}  LR(backbone): {backbone_lr:.2e}")
 
-torch.save(model.state_dict(), MODEL_PATH)
-print(f"\nModel saved → {MODEL_PATH}")
+    # Keep the best snapshot
+    if train_acc > best_acc:
+        best_acc   = train_acc
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+# Save the best snapshot (not necessarily last epoch)
+torch.save(best_state, MODEL_PATH)
+print(f"\nBest train acc: {best_acc:.1f}%  |  Model saved → {MODEL_PATH}")
 
 # =====================================
 # EVALUATION
 # =====================================
 
+# Load best weights before eval
+model.load_state_dict(best_state)
 model.eval()
 y_true, y_pred = [], []
 
@@ -444,11 +466,11 @@ with torch.no_grad():
     for imgs, labels in test_loader:
         imgs       = imgs.to(device)
         eeg_dummy  = torch.zeros(imgs.size(0), CFG["eeg_dim"],  device=device)
-        fmri_dummy = torch.zeros(imgs.size(0), CFG["fmri_dim"], device=device) if use_fmri else None
-        logits     = model(imgs, eeg_dummy, fmri_dummy)
-        preds      = logits.argmax(1)
+        fmri_dummy = (torch.zeros(imgs.size(0), CFG["fmri_dim"], device=device)
+                      if use_fmri else None)
+        logits = model(imgs, eeg_dummy, fmri_dummy)
         y_true.extend(labels.numpy())
-        y_pred.extend(preds.cpu().numpy())
+        y_pred.extend(logits.argmax(1).cpu().numpy())
 
 print("\n--- Classification Report ---")
 print(classification_report(y_true, y_pred,
@@ -459,15 +481,14 @@ print(classification_report(y_true, y_pred,
 # =====================================
 
 cm = confusion_matrix(y_true, y_pred)
-
 plt.figure(figsize=(10, 8))
 sns.heatmap(cm, annot=True, fmt="d", cmap="viridis",
             xticklabels=emotion_labels, yticklabels=emotion_labels)
-plt.title("Emotion Recognition — Confusion Matrix", fontsize=16)
+plt.title("Emotion Recognition — Confusion Matrix v4", fontsize=16)
 plt.xlabel("Predicted")
 plt.ylabel("True")
 plt.xticks(rotation=45, ha="right")
 plt.tight_layout()
-plt.savefig("confusion_matrix_v2.png", dpi=150)
+plt.savefig("confusion_matrix_v4.png", dpi=150)
 plt.show()
-print("Confusion matrix saved → confusion_matrix_v2.png")
+print("Confusion matrix saved → confusion_matrix_v4.png")

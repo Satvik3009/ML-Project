@@ -23,7 +23,7 @@ UPLOAD_FOLDER  = Path("uploads")
 OUTPUT_FOLDER  = Path("outputs")
 CHECKPOINT_DIR = Path("checkpoints")
 
-EMOTION_CKPT   = Path(r"C:\Users\HP\ML_project\emotion_model_v3.pth")
+EMOTION_CKPT   = Path(r"C:\Users\HP\ML_project\emotion_model_v4.pth")
 TUMOR_CKPT     = Path(r"C:\Users\HP\ML_project\tumor_cnn_best_new.pt")
 
 ALLOWED_EXT    = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
