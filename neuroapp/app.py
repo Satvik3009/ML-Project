@@ -200,7 +200,11 @@ def load_emotion_model():
             nn.Linear(HIDDEN_DIM, N_EMO),
         ).to(DEVICE)
 
-        emotion_clf[0].weight = nn.Parameter(clf0_w[:, :FACE_DIM].clone())
+        # fix — check shape first and slice correctly
+        if clf0_w.dim() == 2:
+            emotion_clf[0].weight = nn.Parameter(clf0_w[:, :FACE_DIM].clone())
+        elif clf0_w.dim() == 1:
+            emotion_clf[0].weight = nn.Parameter(clf0_w[:FACE_DIM].clone())
         emotion_clf[0].bias   = nn.Parameter(clf0_b.clone())
         emotion_clf[2].weight = nn.Parameter(final_w.clone())
         emotion_clf[2].bias   = nn.Parameter(final_b.clone())

@@ -14,6 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 import torchvision.models as tv_models
+from transformers import AutoModel
+
 
 # =====================================================
 # CONFIG
@@ -35,8 +37,9 @@ EMOTION_EMOJI   = {
     "happy": "😄", "neutral": "😐", "sad": "😢", "surprise": "😲"
 }
 
-# Emotion model dims (unchanged)
-FACE_DIM   = 1408
+# NEW — matches your frozen ViT checkpoint
+FACE_DIM   = 768   # ViT-B/16 [CLS] token
+FUSED_DIM  = 832   # 768 (face) + 64 (eeg)
 HIDDEN_DIM = 256
 N_EMO      = len(EMOTION_CLASSES)
 N_TUMOR    = len(TUMOR_CLASSES)
@@ -65,17 +68,21 @@ def allowed_file(filename):
 # ── Emotion model (unchanged from original) ─────────
 
 class FaceModel(nn.Module):
-    """EfficientNet-B2 backbone matching face_enc.* keys. Output: [B, 1408]"""
+    """ViT backbone matching face_enc.vit.* keys. Output: [B, 768]"""
     def __init__(self):
         super().__init__()
-        base          = tv_models.efficientnet_b2(weights=None)
-        self.features = base.features
-        self.pool     = nn.AdaptiveAvgPool2d((1, 1))
+        self.vit  = AutoModel.from_pretrained(
+            "trpakov/vit-face-expression", ignore_mismatched_sizes=True
+        )
+        self.drop = nn.Dropout(p=0.3)
+        for param in self.vit.parameters():
+            param.requires_grad = False
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.pool(x)
-        return x.view(x.size(0), -1)
+        x = x.repeat(1, 3, 1, 1) if x.shape[1] == 1 else x
+        with torch.no_grad():
+            out = self.vit(pixel_values=x)
+        return self.drop(out.last_hidden_state[:, 0])  # [B, 768]
 
 
 # ── Tumor model (updated: EfficientNet-B0, 3 classes) ──
@@ -163,63 +170,47 @@ def load_emotion_model():
     if EMOTION_CKPT.exists():
         ckpt = torch.load(EMOTION_CKPT, map_location=DEVICE, weights_only=False)
 
-        # Strip "face_enc." prefix to load into FaceModel
+        # Load ViT weights into face_model
         face_state = {
-            k.replace("face_enc.", ""): v
+            k.replace("face_enc.vit.", "vit.").replace("face_enc.drop.", "drop."): v
             for k, v in ckpt.items()
             if k.startswith("face_enc.")
         }
         missing, _ = face_model.load_state_dict(face_state, strict=False)
-        if missing:
-            print(f"[emotion] WARNING: {len(missing)} missing keys in face encoder")
-        else:
-            print(f"[emotion] Face encoder loaded cleanly")
+        print(f"[emotion] Face encoder: {len(missing)} missing keys")
 
-        # Slice face-only columns from fused classifier weight [256, 1504]
-        clf0_w = ckpt["classifier.0.weight"]   # [256, 1504]
-        clf0_b = ckpt["classifier.0.bias"]     # [256]
-
-        # Find the N_EMO-class output layer
-        final_key = None
-        for k, v in ckpt.items():
-            if k.startswith("classifier.") and k.endswith(".weight") and v.shape[0] == N_EMO:
-                final_key = k
-                break
-
-        if final_key is None:
-            raise RuntimeError(
-                f"[emotion] Cannot find {N_EMO}-class output layer in checkpoint."
-            )
-
-        final_w = ckpt[final_key]
-        final_b = ckpt[final_key.replace(".weight", ".bias")]
+        # classifier.1 = Linear(832, 256) — slice face cols only [:, :768]
+        # classifier.4 = Linear(256, 7)
+        clf1_w = ckpt["classifier.1.weight"]   # [256, 832]
+        clf1_b = ckpt["classifier.1.bias"]     # [256]
+        clf4_w = ckpt["classifier.4.weight"]   # [7, 256]
+        clf4_b = ckpt["classifier.4.bias"]     # [7]
 
         emotion_clf = nn.Sequential(
-            nn.Linear(FACE_DIM, HIDDEN_DIM),
-            nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, N_EMO),
+            nn.Linear(FACE_DIM, HIDDEN_DIM),   # 768 -> 256
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(HIDDEN_DIM, N_EMO),      # 256 -> 7
         ).to(DEVICE)
 
-        emotion_clf[0].weight = nn.Parameter(clf0_w[:, :FACE_DIM].clone())
-        emotion_clf[0].bias   = nn.Parameter(clf0_b.clone())
-        emotion_clf[2].weight = nn.Parameter(final_w.clone())
-        emotion_clf[2].bias   = nn.Parameter(final_b.clone())
+        # Slice face-only columns (first 768 of 832)
+        emotion_clf[0].weight = nn.Parameter(clf1_w[:, :FACE_DIM].clone())
+        emotion_clf[0].bias   = nn.Parameter(clf1_b.clone())
+        emotion_clf[3].weight = nn.Parameter(clf4_w.clone())
+        emotion_clf[3].bias   = nn.Parameter(clf4_b.clone())
 
-        print(f"[emotion] Classifier: {FACE_DIM}->{HIDDEN_DIM}->{N_EMO} "
-              f"(sliced [:, :{FACE_DIM}] from [256, 1504])")
-        print(f"[emotion] Loaded from {EMOTION_CKPT}")
-
+        print(f"[emotion] Classifier: {FACE_DIM}->{HIDDEN_DIM}->{N_EMO} loaded")
     else:
         emotion_clf = nn.Sequential(
             nn.Linear(FACE_DIM, HIDDEN_DIM),
-            nn.ReLU(),
+            nn.GELU(),
+            nn.Dropout(0.3),
             nn.Linear(HIDDEN_DIM, N_EMO),
         ).to(DEVICE)
-        print(f"[emotion] Checkpoint not found - using random weights")
+        print(f"[emotion] Checkpoint not found — random weights")
 
     face_model.eval()
     emotion_clf.eval()
-
 
 def load_tumor_model():
     global tumor_model
@@ -247,11 +238,11 @@ load_tumor_model()
 # TRANSFORMS
 # =====================================================
 
-# EfficientNet-B2 native resolution for emotion
+# vit model native resolution for emotion
 emotion_tf = T.Compose([
-    T.Resize((260, 260)),
+    T.Resize((224, 224)),
     T.ToTensor(),
-    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+    T.Normalize([0.5], [0.5]),   # grayscale norm matching training
 ])
 
 # EfficientNet-B0 native resolution for tumor (updated from 96x96)
@@ -267,10 +258,11 @@ tumor_tf = T.Compose([
 # =====================================================
 
 def predict_emotion(pil_img: Image.Image):
-    tensor = emotion_tf(pil_img).unsqueeze(0).to(DEVICE)
+    img    = pil_img.convert("L").convert("RGB")  # grayscale → 3ch
+    tensor = emotion_tf(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        feats  = face_model(tensor)           # [1, 1408]
-        logits = emotion_clf(feats)           # [1, 7]
+        feats  = face_model(tensor)       # [1, 768]
+        logits = emotion_clf(feats)       # [1, 7]
         probs  = torch.softmax(logits, dim=1).squeeze().cpu().numpy()
     idx = int(probs.argmax())
     return {
